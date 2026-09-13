@@ -7,6 +7,8 @@ Commands:
   /status     - shows saved risk result + free doc-generations remaining
   /generate   - upload a trace JSON file, get a drafted Annex IV paragraph as .docx
   /upgrade    - link to attestly.online/pricing once free limit is hit
+  /ban        - (group admins only) reply to a message to ban that user
+  /promote    - (group admins only) reply to a message to promote that user
   /help       - list commands
 
 Storage: local SQLite (attestly_bot.db) - one row per Telegram user.
@@ -14,23 +16,29 @@ Storage: local SQLite (attestly_bot.db) - one row per Telegram user.
 
 import os
 import io
+import re
+import time
 import json
 import logging
 import sqlite3
+from collections import defaultdict, deque
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ChatMemberHandler,
     ContextTypes,
     ConversationHandler,
     filters,
 )
 
 from docx import Document
+from faq_data import TOPICS
 
 try:
     from anthropic import Anthropic
@@ -47,6 +55,17 @@ DB_PATH = os.environ.get("ATTESTLY_BOT_DB", "attestly_bot.db")
 PRICING_URL = "https://www.attestly.online/pricing"
 LOGIN_URL = "https://www.attestly.online/login"
 FREE_GENERATIONS = 3  # free docx drafts per user before we point them to pricing
+
+# --- moderation config ---
+ALLOWED_LINK_DOMAINS = ("attestly.online",)  # links to these domains are never removed
+MAX_LINKS_PER_MESSAGE = 2       # more than this from a non-admin is treated as spam
+DUPLICATE_WINDOW_SECONDS = 30   # same user repeating identical text within this window = spam
+FAQ_COOLDOWN_SECONDS = 20       # per-chat cooldown between two keyword-triggered FAQ replies
+WARNING_AUTODELETE_SECONDS = 12 # how long moderation warning messages stay visible
+
+# in-memory moderation state (per-process; resets on restart, which is fine for this scale)
+_last_message_by_user = {}      # (chat_id, user_id) -> (text, timestamp)
+_last_faq_reply_at = defaultdict(float)  # chat_id -> timestamp
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -138,7 +157,10 @@ WELCOME = (
     "/riskcheck \\- free EU AI Act risk classification for your AI system\n"
     "/generate \\- upload a trace file, get a drafted Annex IV section back as a docx\n"
     "/status \\- see your saved risk result and remaining free generations\n"
-    "/upgrade \\- see paid plans on attestly\\.online\n"
+    "/upgrade \\- see paid plans on attestly\\.online\n\n"
+    "In groups, I also answer questions about Attestly and the EU AI Act "
+    "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
+    "support /ban and /promote by replying to a user's message\\.\n"
 )
 
 
@@ -415,6 +437,211 @@ def build_docx(drafted_text: str, trace_events) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Group admin helpers
+# ---------------------------------------------------------------------------
+
+
+async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """True if user_id is an admin/creator of chat_id. Never trust a hardcoded list \u2014
+    always check live against Telegram, so admin rights follow the group's actual settings."""
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def is_bot_admin_here(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Welcome new members
+# ---------------------------------------------------------------------------
+
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            continue
+        name = member.first_name or member.username or "there"
+        await update.message.reply_text(
+            f"Welcome, {name}! This group is about Attestly \u2014 EU AI Act compliance "
+            "generated from your AI agents' traces.\n\n"
+            "Try asking a question (e.g. \"what is annex iv\" or \"how much does it cost\"), "
+            "or message @Attestly_bot directly for /riskcheck and /generate."
+        )
+
+
+# ---------------------------------------------------------------------------
+# /ban and /promote (admin-only, live-checked against Telegram)
+# ---------------------------------------------------------------------------
+
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /ban.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message with /ban to remove them.")
+        return
+    target = update.message.reply_to_message.from_user
+    if await is_group_admin(context, chat.id, target.id):
+        await update.message.reply_text("I won't ban another admin.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat.id, target.id)
+        await update.message.reply_text(f"Banned {target.first_name or target.username}.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't ban that user: {e}\n"
+            "Make sure I have 'Ban users' permission in this group's admin settings."
+        )
+
+
+async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /promote.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message with /promote to make them an admin.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        await context.bot.promote_chat_member(
+            chat.id,
+            target.id,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_pin_messages=True,
+            can_invite_users=True,
+            can_manage_chat=True,
+        )
+        await update.message.reply_text(f"Promoted {target.first_name or target.username} to admin.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't promote that user: {e}\n"
+            "Make sure I have 'Add new admins' permission in this group's admin settings."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Link filter + basic spam control + keyword FAQ
+# One handler covers all group text so moderation always runs before FAQ replies.
+# ---------------------------------------------------------------------------
+
+
+def extract_domains(text: str):
+    urls = re.findall(r"(?:https?://|www\.)[^\s]+", text, flags=re.IGNORECASE)
+    domains = []
+    for u in urls:
+        candidate = u if u.startswith("http") else "http://" + u
+        try:
+            netloc = urlparse(candidate).netloc.lower()
+            netloc = netloc.split("@")[-1]  # strip userinfo if present
+            domains.append(netloc)
+        except Exception:
+            continue
+    return domains
+
+
+def is_allowed_domain(domain: str) -> bool:
+    return any(domain == d or domain.endswith("." + d) for d in ALLOWED_LINK_DOMAINS)
+
+
+async def delete_with_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str):
+    chat_id = update.effective_chat.id
+    try:
+        await update.message.delete()
+    except Exception:
+        return  # bot probably lacks delete permission; don't also spam a notice
+    user = update.effective_user
+    name = user.first_name or user.username or "there"
+    notice = await context.bot.send_message(chat_id, f"Removed a message from {name}: {reason}")
+    context.job_queue.run_once(
+        lambda ctx: ctx.bot.delete_message(chat_id, notice.message_id),
+        WARNING_AUTODELETE_SECONDS,
+    )
+
+
+def match_faq(text: str):
+    text_l = text.lower()
+    best = None
+    best_score = 0
+    for topic in TOPICS:
+        score = sum(1 for kw in topic["keywords"] if kw in text_l)
+        if score > best_score:
+            best = topic
+            best_score = score
+    return best if best_score > 0 else None
+
+
+async def group_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs on every non-command group text message: enforces link/spam rules first,
+    then (if nothing was removed) tries a keyword-matched FAQ reply."""
+    message = update.message
+    if not message or not message.text:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return  # moderation/FAQ only applies in groups, not DMs
+    user = update.effective_user
+    text = message.text
+
+    sender_is_admin = await is_group_admin(context, chat.id, user.id)
+
+    # 1) link filter: remove links to any domain that isn't attestly.online, unless sender is admin
+    if not sender_is_admin:
+        domains = extract_domains(text)
+        bad_domains = [d for d in domains if not is_allowed_domain(d)]
+        if bad_domains:
+            await delete_with_notice(
+                update, context,
+                f"links to {', '.join(sorted(set(bad_domains)))} aren't allowed here \u2014 "
+                "only attestly.online links.",
+            )
+            return
+        if len(domains) > MAX_LINKS_PER_MESSAGE:
+            await delete_with_notice(update, context, "too many links (looks like spam).")
+            return
+
+    # 2) duplicate-message spam control (same user repeating identical text quickly)
+    if not sender_is_admin:
+        key = (chat.id, user.id)
+        prev = _last_message_by_user.get(key)
+        now = time.time()
+        if prev and prev[0] == text.strip() and (now - prev[1]) < DUPLICATE_WINDOW_SECONDS:
+            await delete_with_notice(update, context, "duplicate message (spam control).")
+            return
+        _last_message_by_user[key] = (text.strip(), now)
+
+    # 3) keyword-triggered FAQ (fixed answers, no LLM), with a per-chat cooldown
+    topic = match_faq(text)
+    if topic:
+        now = time.time()
+        if now - _last_faq_reply_at[chat.id] >= FAQ_COOLDOWN_SECONDS:
+            await message.reply_text(topic["answer"])
+            _last_faq_reply_at[chat.id] = now
+
+
+# ---------------------------------------------------------------------------
 # /upgrade
 # ---------------------------------------------------------------------------
 
@@ -436,7 +663,13 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("upgrade", upgrade))
     app.add_handler(CommandHandler("generate", generate_start))
+    app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("promote", promote_user))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, group_message_router)
+    )
 
     riskcheck_conv = ConversationHandler(
         entry_points=[CommandHandler("riskcheck", riskcheck_start)],
