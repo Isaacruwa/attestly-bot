@@ -23,6 +23,28 @@ state lives in a local SQLite file.
 - `/pin` — (group admins only) reply to a message to pin it (add `silent` to pin quietly)
 - `/unpin` — (group admins only) reply to unpin a specific message, or run with no reply
   to unpin the most recent pin
+- `/announce <text>` — (channel admins only, DM the bot) posts an update to the Attestly
+  Telegram channel with auto-attached hashtags for discoverability
+
+## Channel announcements
+
+Two ways updates reach the Telegram channel (default: `@AI_Act_Compliance`, set via
+`ANNOUNCE_CHANNEL_ID`):
+
+1. **Manual, works today**: any admin of that channel can DM the bot `/announce <text>`
+   and it posts immediately, with hashtags like `#EUAIAct #AICompliance` (plus topic-specific
+   ones like `#AnnexIV` or `#GPAI` when the text matches those subjects) so the post is
+   discoverable via Telegram's in-app search.
+2. **Automatic, dormant until you have content to watch**: set `WATCH_URLS` (comma-separated
+   page URLs, e.g. a future `attestly.online/blog` or `/changelog`) and the bot checks them
+   every `WATCH_INTERVAL_HOURS` (default 6) for content changes, posting an alert to the
+   channel when something changes. **attestly.online has no blog/changelog yet**, so this is
+   off by default — there's nothing meaningful to watch until one exists. The first check on
+   any URL just records a baseline (no post), so adding a URL won't trigger a false alert.
+
+For either to work, the bot needs to be an **admin of the channel** with **Post Messages**
+permission — same "human has to grant it" rule as groups (Administrators → Add Admin →
+select the bot).
 
 ## Group features (no LLM — fixed keyword matching)
 
