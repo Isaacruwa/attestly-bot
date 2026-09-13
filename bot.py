@@ -17,12 +17,14 @@ import io
 import re
 import time
 import json
+import hashlib
 import logging
 import sqlite3
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
     Application,
@@ -61,6 +63,16 @@ DUPLICATE_WINDOW_SECONDS = 30   # same user repeating identical text within this
 FAQ_COOLDOWN_SECONDS = 20       # per-chat cooldown between two keyword-triggered FAQ replies
 WARNING_AUTODELETE_SECONDS = 12 # how long moderation warning messages stay visible
 
+# --- channel announcement config ---
+# The channel the bot posts updates to. The bot must be an admin of this channel
+# with "Post Messages" permission for either feature below to work.
+ANNOUNCE_CHANNEL_ID = os.environ.get("ANNOUNCE_CHANNEL_ID", "@AI_Act_Compliance")
+# Comma-separated URLs to watch for content changes (e.g. a future attestly.online/blog
+# or /changelog page). Empty by default: attestly.online has no blog/changelog yet, so
+# there's nothing meaningful to watch until one exists. Set via env var once it does.
+WATCH_URLS = [u.strip() for u in os.environ.get("WATCH_URLS", "").split(",") if u.strip()]
+WATCH_INTERVAL_HOURS = float(os.environ.get("WATCH_INTERVAL_HOURS", "6"))
+
 # in-memory moderation state (per-process; resets on restart, which is fine for this scale)
 _last_message_by_user = {}      # (chat_id, user_id) -> (text, timestamp)
 _last_faq_reply_at = defaultdict(float)  # chat_id -> timestamp
@@ -89,6 +101,15 @@ def db():
             risk_checked_at TEXT,
             generations_used INTEGER DEFAULT 0,
             created_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS site_watch (
+            url TEXT PRIMARY KEY,
+            content_hash TEXT,
+            last_checked TEXT
         )
         """
     )
@@ -159,7 +180,8 @@ WELCOME = (
     "In groups, I also answer questions about Attestly and the EU AI Act "
     "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
     "support /ban, /unban, /kick, /mute, /unmute, /promote, /demote, /pin, "
-    "and /unpin by replying to a user's message\\.\n"
+    "and /unpin by replying to a user's message\\.\n\n"
+    "/announce \\(channel admins only\\) \\- post an update to the Attestly channel\\.\n"
 )
 
 
@@ -857,6 +879,121 @@ async def group_message_router(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ---------------------------------------------------------------------------
+# Channel announcements: /announce (manual, works today) +
+# background site-watcher (auto-posts once attestly.online has a blog/changelog)
+# ---------------------------------------------------------------------------
+
+# Fixed hashtags always attached, plus dynamic ones matched against FAQ topics
+# so announcements are discoverable via Telegram's in-app search on those terms.
+CORE_HASHTAGS = "#EUAIAct #AICompliance #Attestly"
+TOPIC_HASHTAGS = {
+    "annex_iv": "#AnnexIV",
+    "risk_tiers": "#AIRiskAssessment",
+    "prohibited_practices": "#Article5",
+    "high_risk_annex_iii": "#AnnexIII #HighRiskAI",
+    "gpai": "#GPAI",
+    "transparency": "#AITransparency",
+    "fines": "#RegTech",
+}
+
+
+def build_hashtags(text: str) -> str:
+    text_l = text.lower()
+    tags = [CORE_HASHTAGS]
+    for topic in TOPICS:
+        if topic["id"] in TOPIC_HASHTAGS and any(kw in text_l for kw in topic["keywords"]):
+            tags.append(TOPIC_HASHTAGS[topic["id"]])
+    return " ".join(dict.fromkeys(tags))  # de-dupe, keep order
+
+
+async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM this to the bot: /announce <text>. Posts to ANNOUNCE_CHANNEL_ID if the
+    requester is an admin of that channel. Works today, independent of the watcher."""
+    if not ANNOUNCE_CHANNEL_ID:
+        await update.message.reply_text("No announcement channel is configured (ANNOUNCE_CHANNEL_ID).")
+        return
+    requester = update.effective_user
+    if not await is_group_admin(context, ANNOUNCE_CHANNEL_ID, requester.id):
+        await update.message.reply_text(
+            "Only admins of the announcement channel can use /announce."
+        )
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Usage: /announce <your update text>")
+        return
+    try:
+        await context.bot.send_message(
+            ANNOUNCE_CHANNEL_ID, f"{text}\n\n{build_hashtags(text)}"
+        )
+        await update.message.reply_text("Posted to the channel.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't post to the channel: {e}\n"
+            "Make sure the bot is an admin of the channel with 'Post Messages' permission."
+        )
+
+
+def get_watch_hash(url: str):
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT content_hash FROM site_watch WHERE url=?", (url,)).fetchone()
+    conn.close()
+    return row["content_hash"] if row else None
+
+
+def set_watch_hash(url: str, content_hash: str):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO site_watch (url, content_hash, last_checked) VALUES (?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET content_hash=excluded.content_hash, last_checked=excluded.last_checked
+        """,
+        (url, content_hash, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_page_hash(url: str) -> str | None:
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "AttestlyBot/1.0"})
+        resp.raise_for_status()
+        # Strip tags/scripts for a rough text-only hash so markup-only changes
+        # (ads, timestamps, nonce attributes) don't trigger false positives.
+        text_only = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", resp.text, flags=re.S | re.I)
+        text_only = re.sub(r"<[^>]+>", " ", text_only)
+        text_only = re.sub(r"\s+", " ", text_only).strip()
+        return hashlib.sha256(text_only.encode("utf-8")).hexdigest()
+    except Exception as e:
+        log.warning(f"site-watch fetch failed for {url}: {e}")
+        return None
+
+
+async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
+    """Runs on a schedule. For each WATCH_URLS entry: if its content changed since
+    last check, post an alert to ANNOUNCE_CHANNEL_ID. First-ever check on a URL just
+    records a baseline (no post), so adding a new URL doesn't trigger a false alert."""
+    if not WATCH_URLS or not ANNOUNCE_CHANNEL_ID:
+        return
+    for url in WATCH_URLS:
+        new_hash = fetch_page_hash(url)
+        if new_hash is None:
+            continue
+        old_hash = get_watch_hash(url)
+        if old_hash is None:
+            set_watch_hash(url, new_hash)
+            continue
+        if new_hash != old_hash:
+            set_watch_hash(url, new_hash)
+            try:
+                text = f"Attestly update \u2014 something changed here:\n{url}"
+                await context.bot.send_message(ANNOUNCE_CHANNEL_ID, f"{text}\n\n{build_hashtags(text)}")
+            except Exception as e:
+                log.warning(f"couldn't post site-watch update: {e}")
+
+
+# ---------------------------------------------------------------------------
 # /upgrade
 # ---------------------------------------------------------------------------
 
@@ -887,6 +1024,7 @@ def main():
     app.add_handler(CommandHandler("unmute", unmute_user))
     app.add_handler(CommandHandler("pin", pin_message))
     app.add_handler(CommandHandler("unpin", unpin_message))
+    app.add_handler(CommandHandler("announce", announce))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
     app.add_handler(
@@ -904,6 +1042,14 @@ def main():
         fallbacks=[CommandHandler("cancel", riskcheck_cancel)],
     )
     app.add_handler(riskcheck_conv)
+
+    if WATCH_URLS and ANNOUNCE_CHANNEL_ID:
+        app.job_queue.run_repeating(
+            check_for_updates, interval=WATCH_INTERVAL_HOURS * 3600, first=60
+        )
+        log.info(f"Site watcher enabled for {WATCH_URLS} -> {ANNOUNCE_CHANNEL_ID}")
+    else:
+        log.info("Site watcher disabled (no WATCH_URLS configured yet)")
 
     log.info("Attestly bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
