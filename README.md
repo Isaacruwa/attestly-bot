@@ -11,7 +11,18 @@ state lives in a local SQLite file.
 - `/status` — shows saved risk result + free generations remaining
 - `/upgrade` — links to attestly.online/pricing
 - `/ban` — (group admins only) reply to a user's message to ban them
+- `/unban` — (group admins only) reply to their message, or `/unban <user_id>` (needed
+  since a banned user leaves no recent message to reply to)
+- `/kick` — (group admins only) reply to remove someone without a permanent ban — they
+  can rejoin via invite link
+- `/mute` — (group admins only) reply to silence someone; optionally `/mute 10m`, `/mute 2h`,
+  `/mute 1d` for a timed mute, or no duration for indefinite (until `/unmute`)
+- `/unmute` — (group admins only) reply to restore a muted user's permissions
 - `/promote` — (group admins only) reply to a user's message to make them a group admin
+- `/demote` — (group admins only) reply to remove someone's admin rights
+- `/pin` — (group admins only) reply to a message to pin it (add `silent` to pin quietly)
+- `/unpin` — (group admins only) reply to unpin a specific message, or run with no reply
+  to unpin the most recent pin
 
 ## Group features (no LLM — fixed keyword matching)
 
@@ -33,12 +44,13 @@ per group:
 1. Open the group → group name → **Administrators** → **Add Admin** → select the bot
 2. Enable at minimum:
    - **Delete messages** (for link/spam filtering)
-   - **Ban users** (for `/ban`)
-   - **Add new admins** (for `/promote` — Telegram requires this specific permission)
+   - **Ban users** (for `/ban`, `/kick`, `/mute`, `/unmute`)
+   - **Add new admins** (for `/promote`/`/demote` — Telegram requires this specific permission)
+   - **Pin messages** (for `/pin`/`/unpin`)
 3. Save
 
-Without these, the bot still welcomes members and answers FAQ questions, but `/ban` and
-`/promote` will reply with an error, and it won't be able to delete spam/link messages.
+Without these, the bot still welcomes members and answers FAQ questions, but the admin
+commands above will reply with an error, and it won't be able to delete spam/link messages.
 
 ### Adding or editing FAQ answers
 
