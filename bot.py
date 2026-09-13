@@ -73,6 +73,11 @@ ANNOUNCE_CHANNEL_ID = os.environ.get("ANNOUNCE_CHANNEL_ID", "@AI_Act_Compliance"
 WATCH_URLS = [u.strip() for u in os.environ.get("WATCH_URLS", "").split(",") if u.strip()]
 WATCH_INTERVAL_HOURS = float(os.environ.get("WATCH_INTERVAL_HOURS", "6"))
 
+# --- chat cleanliness config ---
+WELCOME_AUTODELETE_SECONDS = 180  # 3 minutes
+COMMAND_AUTODELETE_SECONDS = 10   # how long admin command messages + confirmations stay visible
+PURGE_MAX_MESSAGES = 200          # safety cap per /purge run
+
 # in-memory moderation state (per-process; resets on restart, which is fine for this scale)
 _last_message_by_user = {}      # (chat_id, user_id) -> (text, timestamp)
 _last_faq_reply_at = defaultdict(float)  # chat_id -> timestamp
@@ -113,7 +118,38 @@ def db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            clean_service INTEGER DEFAULT 1
+        )
+        """
+    )
     return conn
+
+
+def get_clean_service(chat_id: int) -> bool:
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT clean_service FROM chat_settings WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return bool(row["clean_service"]) if row else True  # on by default
+
+
+def set_clean_service(chat_id: int, enabled: bool):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO chat_settings (chat_id, clean_service) VALUES (?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET clean_service=excluded.clean_service
+        """,
+        (chat_id, int(enabled)),
+    )
+    conn.commit()
+    conn.close()
 
 
 def upsert_user(telegram_id: int, username: str | None):
@@ -180,7 +216,9 @@ WELCOME = (
     "In groups, I also answer questions about Attestly and the EU AI Act "
     "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
     "support /ban, /unban, /kick, /mute, /unmute, /promote, /demote, /pin, "
-    "and /unpin by replying to a user's message\\.\n\n"
+    "/unpin, and /purge by replying to a user's message\\.\n\n"
+    "/cleanservice on\\|off \\(admins\\) \\- toggle auto\\-cleanup of join notices "
+    "and command clutter\\.\n\n"
     "/announce \\(channel admins only\\) \\- post an update to the Attestly channel\\.\n"
 )
 
@@ -481,24 +519,146 @@ async def is_bot_admin_here(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
         return False
 
 
+async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: float):
+    context.job_queue.run_once(
+        lambda ctx: ctx.bot.delete_message(chat_id, message_id), delay
+    )
+
+
+async def clean_command_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text: str):
+    """Sends an admin command's confirmation, then (if clean_service is on for this chat)
+    deletes both the invoking /command message and this confirmation shortly after \u2014
+    keeps the chat from filling up with command clutter."""
+    chat_id = update.effective_chat.id
+    sent = await update.message.reply_text(reply_text)
+    if get_clean_service(chat_id):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await delete_later(context, chat_id, sent.message_id, COMMAND_AUTODELETE_SECONDS)
+
+
 # ---------------------------------------------------------------------------
-# Welcome new members
+# Welcome new members (single message, auto-deleted; join service notice removed)
 # ---------------------------------------------------------------------------
 
 
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members:
         return
-    for member in update.message.new_chat_members:
-        if member.is_bot:
-            continue
-        name = member.first_name or member.username or "there"
-        await update.message.reply_text(
-            f"Welcome, {name}! This group is about Attestly \u2014 EU AI Act compliance "
+    chat_id = update.effective_chat.id
+    clean = get_clean_service(chat_id)
+    real_members = [m for m in update.message.new_chat_members if not m.is_bot]
+
+    if real_members:
+        names = ", ".join(m.first_name or m.username or "there" for m in real_members)
+        sent = await update.message.reply_text(
+            f"Welcome, {names}! This group is about Attestly \u2014 EU AI Act compliance "
             "generated from your AI agents' traces.\n\n"
             "Try asking a question (e.g. \"what is annex iv\" or \"how much does it cost\"), "
             "or message @Attestly_bot directly for /riskcheck and /generate."
         )
+        if clean:
+            await delete_later(context, chat_id, sent.message_id, WELCOME_AUTODELETE_SECONDS)
+
+    # Remove Telegram's own "X joined the group" service notice so only one message
+    # (our welcome, above) marks the join \u2014 not two.
+    if clean:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+async def clean_other_service_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes Telegram's own service messages (left member, pinned notice, title/photo
+    changes, etc.) when clean_service is on for the chat. New-member joins are handled
+    separately by welcome_new_members so they aren't double-deleted here."""
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not get_clean_service(chat_id):
+        return
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+
+async def cleanservice_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /cleanservice.")
+        return
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = "on" if get_clean_service(chat.id) else "off"
+        await update.message.reply_text(
+            f"Clean-service mode is currently {current}. Usage: /cleanservice on|off"
+        )
+        return
+    enabled = context.args[0].lower() == "on"
+    set_clean_service(chat.id, enabled)
+    await update.message.reply_text(
+        f"Clean-service mode turned {'on' if enabled else 'off'}. "
+        + ("Join notices and command clutter will now be auto-removed."
+           if enabled else
+           "Join notices, welcome messages, and command messages will stay visible.")
+    )
+
+
+# ---------------------------------------------------------------------------
+# /purge (admin-only): bulk delete messages
+# ---------------------------------------------------------------------------
+
+
+async def purge_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /purge.")
+        return
+
+    command_msg_id = update.message.message_id
+
+    if update.message.reply_to_message:
+        start_id = update.message.reply_to_message.message_id
+        end_id = command_msg_id
+        count = end_id - start_id + 1
+        if count > PURGE_MAX_MESSAGES:
+            await update.message.reply_text(
+                f"That range is {count} messages \u2014 capped at {PURGE_MAX_MESSAGES} per run. "
+                "Reply to a more recent message and try again."
+            )
+            return
+        ids_to_delete = list(range(start_id, end_id + 1))
+    elif context.args and context.args[0].isdigit():
+        n = min(int(context.args[0]), PURGE_MAX_MESSAGES)
+        ids_to_delete = list(range(command_msg_id - n, command_msg_id + 1))
+    else:
+        await update.message.reply_text(
+            "Reply to a message with /purge to delete everything from there to now, "
+            f"or use /purge <N> to delete the last N messages (max {PURGE_MAX_MESSAGES})."
+        )
+        return
+
+    deleted = 0
+    for mid in ids_to_delete:
+        try:
+            await context.bot.delete_message(chat.id, mid)
+            deleted += 1
+        except Exception:
+            pass  # message already gone, too old, or never existed \u2014 skip silently
+
+    confirmation = await context.bot.send_message(chat.id, f"Purged {deleted} message(s).")
+    await delete_later(context, chat.id, confirmation.message_id, COMMAND_AUTODELETE_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +684,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.ban_chat_member(chat.id, target.id)
-        await update.message.reply_text(f"Banned {target.first_name or target.username}.")
+        await clean_command_exchange(update, context, f"Banned {target.first_name or target.username}.")
     except Exception as e:
         await update.message.reply_text(
             f"Couldn't ban that user: {e}\n"
@@ -555,7 +715,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_invite_users=True,
             can_manage_chat=True,
         )
-        await update.message.reply_text(f"Promoted {target.first_name or target.username} to admin.")
+        await clean_command_exchange(update, context, f"Promoted {target.first_name or target.username} to admin.")
     except Exception as e:
         await update.message.reply_text(
             f"Couldn't promote that user: {e}\n"
@@ -589,7 +749,7 @@ async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_change_info=False,
             can_manage_video_chats=False,
         )
-        await update.message.reply_text(f"Demoted {target.first_name or target.username}.")
+        await clean_command_exchange(update, context, f"Demoted {target.first_name or target.username}.")
     except Exception as e:
         await update.message.reply_text(f"Couldn't demote that user: {e}")
 
@@ -617,7 +777,7 @@ async def unban_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
-        await update.message.reply_text("Unbanned. They can rejoin now.")
+        await clean_command_exchange(update, context, "Unbanned. They can rejoin now.")
     except Exception as e:
         await update.message.reply_text(f"Couldn't unban: {e}")
 
@@ -642,7 +802,9 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.ban_chat_member(chat.id, target.id)
         await context.bot.unban_chat_member(chat.id, target.id, only_if_banned=True)
-        await update.message.reply_text(f"Kicked {target.first_name or target.username} (they can rejoin via invite link).")
+        await clean_command_exchange(
+            update, context, f"Kicked {target.first_name or target.username} (they can rejoin via invite link)."
+        )
     except Exception as e:
         await update.message.reply_text(f"Couldn't kick that user: {e}")
 
@@ -692,7 +854,7 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             until_date=until_date,
         )
         duration_note = f" for {context.args[0]}" if context.args else ""
-        await update.message.reply_text(f"Muted {target.first_name or target.username}{duration_note}.")
+        await clean_command_exchange(update, context, f"Muted {target.first_name or target.username}{duration_note}.")
     except Exception as e:
         await update.message.reply_text(
             f"Couldn't mute that user: {e}\n"
@@ -730,7 +892,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 can_add_web_page_previews=True,
             ),
         )
-        await update.message.reply_text(f"Unmuted {target.first_name or target.username}.")
+        await clean_command_exchange(update, context, f"Unmuted {target.first_name or target.username}.")
     except Exception as e:
         await update.message.reply_text(f"Couldn't unmute that user: {e}")
 
@@ -752,7 +914,7 @@ async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.pin_chat_message(
             chat.id, update.message.reply_to_message.message_id, disable_notification=silent
         )
-        await update.message.reply_text("Pinned.")
+        await clean_command_exchange(update, context, "Pinned.")
     except Exception as e:
         await update.message.reply_text(
             f"Couldn't pin that message: {e}\n"
@@ -774,7 +936,7 @@ async def unpin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.unpin_chat_message(chat.id, update.message.reply_to_message.message_id)
         else:
             await context.bot.unpin_chat_message(chat.id)  # unpins the most recent pin
-        await update.message.reply_text("Unpinned.")
+        await clean_command_exchange(update, context, "Unpinned.")
     except Exception as e:
         await update.message.reply_text(f"Couldn't unpin: {e}")
 
@@ -1025,8 +1187,16 @@ def main():
     app.add_handler(CommandHandler("pin", pin_message))
     app.add_handler(CommandHandler("unpin", unpin_message))
     app.add_handler(CommandHandler("announce", announce))
+    app.add_handler(CommandHandler("purge", purge_messages))
+    app.add_handler(CommandHandler("cleanservice", cleanservice_toggle))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.ALL & ~filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            clean_other_service_messages,
+        )
+    )
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, group_message_router)
     )
