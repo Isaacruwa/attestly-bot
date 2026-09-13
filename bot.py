@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, LabeledPrice
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +34,7 @@ from telegram.ext import (
     ChatMemberHandler,
     ContextTypes,
     ConversationHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -55,6 +56,15 @@ DB_PATH = os.environ.get("ATTESTLY_BOT_DB", "attestly_bot.db")
 PRICING_URL = "https://www.attestly.online/pricing"
 LOGIN_URL = "https://www.attestly.online/login"
 FREE_GENERATIONS = 3  # free docx drafts per user before we point them to pricing
+
+# --- generation-pack payment config ---
+# Telegram Stars (XTR) need no provider setup and work everywhere instantly.
+GENERATION_PACK_SIZE = int(os.environ.get("GENERATION_PACK_SIZE", "10"))
+GENERATION_PACK_STARS = int(os.environ.get("GENERATION_PACK_STARS", "150"))  # ~$2-3 equivalent
+# Ammer Pay (fiat, USD): set AMMER_PAY_TOKEN in Railway env vars, never commit it to the repo.
+AMMER_PAY_TOKEN = os.environ.get("AMMER_PAY_TOKEN")
+AMMER_PAY_CURRENCY = "USD"
+GENERATION_PACK_USD_CENTS = int(os.environ.get("GENERATION_PACK_USD_CENTS", "299"))  # $2.99
 
 # --- moderation config ---
 ALLOWED_LINK_DOMAINS = ("attestly.online",)  # links to these domains are never removed
@@ -105,6 +115,7 @@ def db():
             risk_result TEXT,
             risk_checked_at TEXT,
             generations_used INTEGER DEFAULT 0,
+            purchased_generations INTEGER DEFAULT 0,
             created_at TEXT
         )
         """
@@ -201,6 +212,22 @@ def increment_generations(telegram_id: int) -> int:
     return row["generations_used"]
 
 
+def add_purchased_generations(telegram_id: int, n: int):
+    conn = db()
+    conn.execute(
+        "UPDATE users SET purchased_generations = purchased_generations + ? WHERE telegram_id=?",
+        (n, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_generation_limit(telegram_id: int) -> int:
+    row = get_user(telegram_id)
+    purchased = row["purchased_generations"] if row and row["purchased_generations"] else 0
+    return FREE_GENERATIONS + purchased
+
+
 # ---------------------------------------------------------------------------
 # /start, /help
 # ---------------------------------------------------------------------------
@@ -212,6 +239,7 @@ WELCOME = (
     "/riskcheck \\- free EU AI Act risk classification for your AI system\n"
     "/generate \\- upload a trace file, get a drafted Annex IV section back as a docx\n"
     "/status \\- see your saved risk result and remaining free generations\n"
+    "/buy \\- purchase extra doc\\-generations \\(Telegram Stars or card\\)\n"
     "/upgrade \\- see paid plans on attestly\\.online\n\n"
     "In groups, I also answer questions about Attestly and the EU AI Act "
     "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
@@ -371,11 +399,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_user(user.id)
     risk = row["risk_result"] if row and row["risk_result"] else "not checked yet \u2014 run /riskcheck"
     used = row["generations_used"] if row else 0
-    remaining = max(FREE_GENERATIONS - used, 0)
+    limit = get_generation_limit(user.id)
+    remaining = max(limit - used, 0)
     await update.message.reply_text(
         f"Risk classification: {risk}\n"
-        f"Free doc-generations remaining: {remaining}/{FREE_GENERATIONS}\n\n"
-        f"Full account + history: {LOGIN_URL}"
+        f"Doc-generations remaining: {remaining}/{limit}\n\n"
+        f"Full account + history: {LOGIN_URL}\n"
+        "Need more? /buy"
     )
 
 
@@ -390,10 +420,10 @@ async def generate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_user(user.id)
     used = row["generations_used"] if row else 0
 
-    if used >= FREE_GENERATIONS:
+    if used >= get_generation_limit(user.id):
         await update.message.reply_text(
-            "You've used all your free doc-generations.\n"
-            f"See paid plans here: {PRICING_URL}"
+            "You've used all your doc-generations.\n"
+            f"Buy more with /buy, or see paid plans here: {PRICING_URL}"
         )
         return
 
@@ -415,9 +445,10 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     row = get_user(user.id)
     used = row["generations_used"] if row else 0
-    if used >= FREE_GENERATIONS:
+    limit = get_generation_limit(user.id)
+    if used >= limit:
         await update.message.reply_text(
-            f"You've used all your free doc-generations. See plans: {PRICING_URL}"
+            f"You've used all your doc-generations. Buy more with /buy, or see plans: {PRICING_URL}"
         )
         return
 
@@ -444,15 +475,16 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     docx_path = build_docx(drafted, trace_events)
-    remaining_after = FREE_GENERATIONS - increment_generations(user.id)
+    used_after = increment_generations(user.id)
+    remaining_after = max(limit - used_after, 0)
 
     with open(docx_path, "rb") as f:
         await update.message.reply_document(
             document=f,
             filename="annex_iv_draft.docx",
             caption=(
-                f"Drafted section attached. Free generations left: "
-                f"{max(remaining_after, 0)}/{FREE_GENERATIONS}. "
+                f"Drafted section attached. Generations left: "
+                f"{remaining_after}/{limit}. "
                 f"Full account + more sections: {LOGIN_URL}"
             ),
         )
@@ -1156,6 +1188,80 @@ async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /buy: generation packs via Telegram Stars (instant, no setup) or Ammer Pay (USD)
+# ---------------------------------------------------------------------------
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    upsert_user(user.id, user.username)
+    buttons = [
+        [InlineKeyboardButton(
+            f"\u2b50 {GENERATION_PACK_STARS} Stars \u2014 {GENERATION_PACK_SIZE} generations",
+            callback_data="buy_stars",
+        )]
+    ]
+    if AMMER_PAY_TOKEN:
+        buttons.append([InlineKeyboardButton(
+            f"\U0001f4b3 ${GENERATION_PACK_USD_CENTS/100:.2f} \u2014 {GENERATION_PACK_SIZE} generations",
+            callback_data="buy_fiat",
+        )])
+    await update.message.reply_text(
+        f"Get {GENERATION_PACK_SIZE} more Annex IV generations:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    title = f"{GENERATION_PACK_SIZE} Attestly generations"
+    description = f"Adds {GENERATION_PACK_SIZE} extra Annex IV doc-generations to your account."
+
+    if query.data == "buy_stars":
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=f"stars_pack_{GENERATION_PACK_SIZE}",
+            provider_token="",  # empty for Telegram Stars
+            currency="XTR",
+            prices=[LabeledPrice(title, GENERATION_PACK_STARS)],
+        )
+    elif query.data == "buy_fiat":
+        if not AMMER_PAY_TOKEN:
+            await context.bot.send_message(chat_id, "Card payments aren't configured yet \u2014 try Stars instead.")
+            return
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=f"fiat_pack_{GENERATION_PACK_SIZE}",
+            provider_token=AMMER_PAY_TOKEN,
+            currency=AMMER_PAY_CURRENCY,
+            prices=[LabeledPrice(title, GENERATION_PACK_USD_CENTS)],
+        )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    # No inventory/stock to check for a digital generation pack \u2014 always approve.
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    user = update.effective_user
+    add_purchased_generations(user.id, GENERATION_PACK_SIZE)
+    method = "Stars" if payment.currency == "XTR" else payment.currency
+    await update.message.reply_text(
+        f"Payment received ({method}) \u2014 {GENERATION_PACK_SIZE} generations added to your account. "
+        "Check /status or run /generate now."
+    )
+
+
+# ---------------------------------------------------------------------------
 # /upgrade
 # ---------------------------------------------------------------------------
 
@@ -1189,6 +1295,10 @@ def main():
     app.add_handler(CommandHandler("announce", announce))
     app.add_handler(CommandHandler("purge", purge_messages))
     app.add_handler(CommandHandler("cleanservice", cleanservice_toggle))
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
     app.add_handler(
