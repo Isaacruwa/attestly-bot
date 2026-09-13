@@ -7,8 +7,6 @@ Commands:
   /status     - shows saved risk result + free doc-generations remaining
   /generate   - upload a trace JSON file, get a drafted Annex IV paragraph as .docx
   /upgrade    - link to attestly.online/pricing once free limit is hit
-  /ban        - (group admins only) reply to a message to ban that user
-  /promote    - (group admins only) reply to a message to promote that user
   /help       - list commands
 
 Storage: local SQLite (attestly_bot.db) - one row per Telegram user.
@@ -160,7 +158,8 @@ WELCOME = (
     "/upgrade \\- see paid plans on attestly\\.online\n\n"
     "In groups, I also answer questions about Attestly and the EU AI Act "
     "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
-    "support /ban and /promote by replying to a user's message\\.\n"
+    "support /ban, /unban, /kick, /mute, /unmute, /promote, /demote, /pin, "
+    "and /unpin by replying to a user's message\\.\n"
 )
 
 
@@ -542,6 +541,222 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def demote_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /demote.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message with /demote to remove their admin rights.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        await context.bot.promote_chat_member(
+            chat.id,
+            target.id,
+            can_delete_messages=False,
+            can_restrict_members=False,
+            can_pin_messages=False,
+            can_invite_users=False,
+            can_manage_chat=False,
+            can_promote_members=False,
+            can_change_info=False,
+            can_manage_video_chats=False,
+        )
+        await update.message.reply_text(f"Demoted {target.first_name or target.username}.")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't demote that user: {e}")
+
+
+async def unban_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /unban.")
+        return
+    args = context.args
+    target_id = None
+    if update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
+    elif args and args[0].lstrip("-").isdigit():
+        target_id = int(args[0])
+    if target_id is None:
+        await update.message.reply_text(
+            "Reply to the banned user's message with /unban, or use /unban <user_id> "
+            "(needed since a banned user has no recent message to reply to)."
+        )
+        return
+    try:
+        await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
+        await update.message.reply_text("Unbanned. They can rejoin now.")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't unban: {e}")
+
+
+async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes the user from the group without a permanent ban (they can rejoin via invite link)."""
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /kick.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message with /kick to remove them (not a permanent ban).")
+        return
+    target = update.message.reply_to_message.from_user
+    if await is_group_admin(context, chat.id, target.id):
+        await update.message.reply_text("I won't kick another admin.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat.id, target.id)
+        await context.bot.unban_chat_member(chat.id, target.id, only_if_banned=True)
+        await update.message.reply_text(f"Kicked {target.first_name or target.username} (they can rejoin via invite link).")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't kick that user: {e}")
+
+
+def parse_duration(text: str) -> int | None:
+    """Parses '10m', '2h', '1d' into seconds. Returns None if unparseable."""
+    m = re.fullmatch(r"(\d+)([smhd])", text.strip().lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /mute.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "Reply to the user's message with /mute (optionally /mute 10m, 2h, or 1d "
+            "for a timed mute; no duration = muted until /unmute)."
+        )
+        return
+    target = update.message.reply_to_message.from_user
+    if await is_group_admin(context, chat.id, target.id):
+        await update.message.reply_text("I won't mute another admin.")
+        return
+
+    until_date = None
+    if context.args:
+        seconds = parse_duration(context.args[0])
+        if seconds is None:
+            await update.message.reply_text("Couldn't parse duration \u2014 use e.g. 10m, 2h, or 1d.")
+            return
+        until_date = datetime.now(timezone.utc).timestamp() + seconds
+
+    try:
+        await context.bot.restrict_chat_member(
+            chat.id,
+            target.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date,
+        )
+        duration_note = f" for {context.args[0]}" if context.args else ""
+        await update.message.reply_text(f"Muted {target.first_name or target.username}{duration_note}.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't mute that user: {e}\n"
+            "Make sure I have 'Ban users' / restrict-members permission in this group's admin settings."
+        )
+
+
+async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /unmute.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the user's message with /unmute to restore their permissions.")
+        return
+    target = update.message.reply_to_message.from_user
+    try:
+        await context.bot.restrict_chat_member(
+            chat.id,
+            target.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+        await update.message.reply_text(f"Unmuted {target.first_name or target.username}.")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't unmute that user: {e}")
+
+
+async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /pin.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to the message you want to pin with /pin.")
+        return
+    silent = bool(context.args and context.args[0].lower() in ("silent", "quiet"))
+    try:
+        await context.bot.pin_chat_message(
+            chat.id, update.message.reply_to_message.message_id, disable_notification=silent
+        )
+        await update.message.reply_text("Pinned.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't pin that message: {e}\n"
+            "Make sure I have 'Pin messages' permission in this group's admin settings."
+        )
+
+
+async def unpin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("This only works in a group.")
+        return
+    if not await is_group_admin(context, chat.id, requester.id):
+        await update.message.reply_text("Only group admins can use /unpin.")
+        return
+    try:
+        if update.message.reply_to_message:
+            await context.bot.unpin_chat_message(chat.id, update.message.reply_to_message.message_id)
+        else:
+            await context.bot.unpin_chat_message(chat.id)  # unpins the most recent pin
+        await update.message.reply_text("Unpinned.")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't unpin: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Link filter + basic spam control + keyword FAQ
 # One handler covers all group text so moderation always runs before FAQ replies.
@@ -664,7 +879,14 @@ def main():
     app.add_handler(CommandHandler("upgrade", upgrade))
     app.add_handler(CommandHandler("generate", generate_start))
     app.add_handler(CommandHandler("ban", ban_user))
+    app.add_handler(CommandHandler("unban", unban_user_cmd))
+    app.add_handler(CommandHandler("kick", kick_user))
     app.add_handler(CommandHandler("promote", promote_user))
+    app.add_handler(CommandHandler("demote", demote_user))
+    app.add_handler(CommandHandler("mute", mute_user))
+    app.add_handler(CommandHandler("unmute", unmute_user))
+    app.add_handler(CommandHandler("pin", pin_message))
+    app.add_handler(CommandHandler("unpin", unpin_message))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
     app.add_handler(
