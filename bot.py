@@ -1300,7 +1300,9 @@ async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
 # are Stars-only on Telegram's platform, fiat providers don't support them)
 # ---------------------------------------------------------------------------
 
-SUBSCRIPTION_PRICE_STARS = int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "4250"))  # ~$85/mo estimate
+SUBSCRIPTION_PRICE_STARS = min(
+    int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "2500")), 2500
+)  # Telegram enforces a hard 2500-Star cap on any single subscription \u2014 this is the max possible
 SUBSCRIPTION_PERIOD_SECONDS = 2592000  # 30 days, Telegram's standard monthly subscription period
 
 
@@ -1403,8 +1405,10 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 
 UPGRADE_TEXT = (
     "\u2b50 *Attestly Pro* \u2014 unlimited Annex IV generations for one AI system, "
-    f"~${SUBSCRIPTION_PRICE_STARS * 0.02:.0f}/month, billed monthly in Telegram Stars.\n\n"
-    "Multiple AI systems still need separate plans \u2014 this covers one system, unlimited traces."
+    f"{SUBSCRIPTION_PRICE_STARS} Stars/month (roughly $35-50 depending on Telegram's "
+    "current Star rate - this is Telegram's maximum allowed price for any Stars "
+    "subscription).\n\n"
+    "Multiple AI systems still need separate plans - this covers one system, unlimited traces."
 )
 
 
