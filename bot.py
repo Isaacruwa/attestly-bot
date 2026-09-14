@@ -25,7 +25,17 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, LabeledPrice
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+    LabeledPrice,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChat,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -56,6 +66,14 @@ DB_PATH = os.environ.get("ATTESTLY_BOT_DB", "attestly_bot.db")
 PRICING_URL = "https://www.attestly.online/pricing"
 LOGIN_URL = "https://www.attestly.online/login"
 FREE_GENERATIONS = 3  # free docx drafts per user before we point them to pricing
+
+# --- bot owner config (for /adminpanel and /grantpro, not tied to any one group) ---
+# Defaults to the three Telegram accounts confirmed as the channel's admins/creator.
+BOT_OWNER_IDS = set(
+    int(x) for x in os.environ.get(
+        "BOT_OWNER_IDS", "8440306556,6444902164,1804638516"
+    ).split(",") if x.strip()
+)
 
 # --- generation-pack payment config ---
 # Telegram Stars (XTR) need no provider setup and work everywhere instantly.
@@ -135,6 +153,19 @@ def db():
         CREATE TABLE IF NOT EXISTS chat_settings (
             chat_id INTEGER PRIMARY KEY,
             clean_service INTEGER DEFAULT 1
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            username TEXT,
+            kind TEXT,
+            currency TEXT,
+            amount INTEGER,
+            created_at TEXT
         )
         """
     )
@@ -260,6 +291,53 @@ def extend_subscription(telegram_id: int, days: int = 30):
     conn.commit()
     conn.close()
     return new_until
+
+
+def log_payment(telegram_id: int, username: str | None, kind: str, currency: str, amount: int):
+    conn = db()
+    conn.execute(
+        "INSERT INTO payments (telegram_id, username, kind, currency, amount, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (telegram_id, username, kind, currency, amount, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_admin_stats():
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    total_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pro_count = conn.execute(
+        "SELECT COUNT(*) c FROM users WHERE subscription_until IS NOT NULL AND subscription_until > ?",
+        (now_iso,),
+    ).fetchone()["c"]
+    earnings = conn.execute(
+        "SELECT currency, SUM(amount) total, COUNT(*) n FROM payments GROUP BY currency"
+    ).fetchall()
+    users = conn.execute(
+        "SELECT telegram_id, username, generations_used, purchased_generations, "
+        "subscription_until FROM users ORDER BY created_at DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return {
+        "total_users": total_users,
+        "pro_count": pro_count,
+        "earnings": earnings,
+        "users": users,
+    }
+
+
+def find_user_by_username(username: str):
+    username = username.lstrip("@").lower()
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT telegram_id FROM users WHERE LOWER(username)=?", (username,)
+    ).fetchone()
+    conn.close()
+    return row["telegram_id"] if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1462,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user = update.effective_user
 
     if payment.invoice_payload == "attestly_pro_monthly":
+        log_payment(user.id, user.username, "subscription", payment.currency, payment.total_amount)
         new_until = extend_subscription(user.id, days=30)
         until_str = datetime.fromisoformat(new_until).strftime("%b %d, %Y")
         await update.message.reply_text(
@@ -1391,6 +1470,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             "Manage or cancel anytime in Telegram Settings \u2192 My Subscriptions."
         )
     else:
+        log_payment(user.id, user.username, "generation_pack", payment.currency, payment.total_amount)
         add_purchased_generations(user.id, GENERATION_PACK_SIZE)
         method = "Stars" if payment.currency == "XTR" else payment.currency
         await update.message.reply_text(
@@ -1403,21 +1483,16 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 # /upgrade
 # ---------------------------------------------------------------------------
 
-UPGRADE_TEXT = (
-    "\u2b50 *Attestly Pro* \u2014 unlimited Annex IV generations for one AI system, "
-    f"{SUBSCRIPTION_PRICE_STARS} Stars/month (roughly $35-50 depending on Telegram's "
-    "current Star rate - this is Telegram's maximum allowed price for any Stars "
-    "subscription).\n\n"
-    "Multiple AI systems still need separate plans - this covers one system, unlimited traces."
-)
-
 
 async def send_upgrade_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    await context.bot.send_message(chat_id, UPGRADE_TEXT, parse_mode="Markdown")
     await context.bot.send_invoice(
         chat_id=chat_id,
         title="Attestly Pro (Monthly)",
-        description="Unlimited Annex IV doc-generations for one AI system, billed monthly.",
+        description=(
+            f"Unlimited Annex IV documentation for one AI system, billed monthly "
+            f"in Telegram Stars ({SUBSCRIPTION_PRICE_STARS} Stars \u2014 Telegram's "
+            f"maximum for any subscription). Multiple AI systems need separate plans."
+        ),
         payload="attestly_pro_monthly",
         provider_token="",  # Stars only \u2014 Telegram doesn't support recurring subscriptions via fiat providers
         currency="XTR",
@@ -1437,12 +1512,150 @@ async def upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /adminpanel and /grantpro (bot-owner only, not tied to any one group)
+# ---------------------------------------------------------------------------
+
+
+def is_bot_owner(user_id: int) -> bool:
+    return user_id in BOT_OWNER_IDS
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_owner(update.effective_user.id):
+        return  # silent - don't reveal this command exists to non-owners
+    stats = get_admin_stats()
+
+    earnings_lines = []
+    for row in stats["earnings"]:
+        if row["currency"] == "XTR":
+            earnings_lines.append(f"\u2b50 {row['total']} Stars total ({row['n']} payments)")
+        else:
+            earnings_lines.append(
+                f"\U0001f4b3 {row['total']/100:.2f} {row['currency']} total ({row['n']} payments)"
+            )
+    earnings_text = "\n".join(earnings_lines) if earnings_lines else "No payments yet"
+
+    user_lines = []
+    for u in stats["users"]:
+        handle = f"@{u['username']}" if u["username"] else f"id:{u['telegram_id']}"
+        subbed = ""
+        if u["subscription_until"]:
+            try:
+                if datetime.fromisoformat(u["subscription_until"]) > datetime.now(timezone.utc):
+                    subbed = " \u2b50Pro"
+            except Exception:
+                pass
+        user_lines.append(
+            f"{handle} (id {u['telegram_id']}) \u2014 {u['generations_used']} used, "
+            f"+{u['purchased_generations']} bought{subbed}"
+        )
+    users_text = "\n".join(user_lines) if user_lines else "No users yet"
+
+    text = (
+        f"\U0001f4ca Attestly Admin Panel\n\n"
+        f"Total users: {stats['total_users']}\n"
+        f"Active Pro subscribers: {stats['pro_count']}\n\n"
+        f"Earnings\n{earnings_text}\n\n"
+        f"Users (most recent 50)\n{users_text}\n\n"
+        f"To grant Pro manually: /grantpro @username or /grantpro <telegram_id> [days]"
+    )
+    # Telegram messages cap at 4096 chars; trim gracefully if the user list gets long.
+    if len(text) > 4000:
+        text = text[:3990] + "\n\u2026(truncated)"
+    await update.message.reply_text(text)
+
+
+async def grant_pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /grantpro @username [days] or /grantpro <telegram_id> [days]")
+        return
+
+    target_arg = context.args[0]
+    days = 30
+    if len(context.args) > 1 and context.args[1].isdigit():
+        days = int(context.args[1])
+
+    if target_arg.startswith("@"):
+        target_id = find_user_by_username(target_arg)
+        if target_id is None:
+            await update.message.reply_text(
+                f"Couldn't find {target_arg} \u2014 they need to have messaged the bot at least "
+                "once (e.g. /start) before I have their account on file."
+            )
+            return
+    elif target_arg.isdigit():
+        target_id = int(target_arg)
+        upsert_user(target_id, None)  # ensure a row exists so the grant has somewhere to land
+    else:
+        await update.message.reply_text("Give me a @username or a numeric Telegram ID.")
+        return
+
+    new_until = extend_subscription(target_id, days=days)
+    until_str = datetime.fromisoformat(new_until).strftime("%b %d, %Y")
+    await update.message.reply_text(f"Granted Pro to {target_arg} until {until_str} ({days} days).")
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"\u2b50 You've been upgraded to Attestly Pro (unlimited generations) until {until_str}."
+        )
+    except Exception:
+        pass  # they may not have started a chat with the bot; grant still applies
+
+
+# ---------------------------------------------------------------------------
+# Command menu (native Telegram "/" autocomplete), scoped by role
+# ---------------------------------------------------------------------------
+
+PUBLIC_COMMANDS = [
+    BotCommand("start", "Main menu"),
+    BotCommand("riskcheck", "Free EU AI Act risk check"),
+    BotCommand("generate", "Draft an Annex IV section from a trace file"),
+    BotCommand("status", "Your plan and usage"),
+    BotCommand("buy", "Buy extra generations"),
+    BotCommand("upgrade", "Upgrade to Pro (unlimited)"),
+    BotCommand("help", "Show the main menu again"),
+]
+
+GROUP_ADMIN_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand("ban", "Reply to a message to ban that user"),
+    BotCommand("unban", "Unban a user by reply or ID"),
+    BotCommand("kick", "Remove a user (not a permanent ban)"),
+    BotCommand("mute", "Silence a user, optionally timed"),
+    BotCommand("unmute", "Restore a muted user's permissions"),
+    BotCommand("promote", "Make a user a group admin"),
+    BotCommand("demote", "Remove a user's admin rights"),
+    BotCommand("pin", "Pin a replied-to message"),
+    BotCommand("unpin", "Unpin a message"),
+    BotCommand("purge", "Bulk-delete messages"),
+    BotCommand("cleanservice", "Toggle auto-cleanup of clutter"),
+    BotCommand("announce", "Post an update to the Attestly channel"),
+]
+
+OWNER_COMMANDS = GROUP_ADMIN_COMMANDS + [
+    BotCommand("adminpanel", "Bot stats, earnings, users"),
+    BotCommand("grantpro", "Manually grant a user Pro"),
+]
+
+
+async def setup_command_menus(app: Application):
+    await app.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+    await app.bot.set_my_commands(GROUP_ADMIN_COMMANDS, scope=BotCommandScopeAllChatAdministrators())
+    for owner_id in BOT_OWNER_IDS:
+        try:
+            await app.bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=owner_id))
+        except Exception as e:
+            log.warning(f"couldn't set owner command menu for {owner_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(setup_command_menus).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1461,6 +1674,8 @@ def main():
     app.add_handler(CommandHandler("announce", announce))
     app.add_handler(CommandHandler("purge", purge_messages))
     app.add_handler(CommandHandler("cleanservice", cleanservice_toggle))
+    app.add_handler(CommandHandler("adminpanel", admin_panel))
+    app.add_handler(CommandHandler("grantpro", grant_pro))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_"))
     app.add_handler(CallbackQueryHandler(menu_admin_button, pattern="^menu_admin$"))
