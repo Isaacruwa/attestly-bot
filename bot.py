@@ -21,7 +21,7 @@ import hashlib
 import logging
 import sqlite3
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -116,6 +116,7 @@ def db():
             risk_checked_at TEXT,
             generations_used INTEGER DEFAULT 0,
             purchased_generations INTEGER DEFAULT 0,
+            subscription_until TEXT,
             created_at TEXT
         )
         """
@@ -228,37 +229,88 @@ def get_generation_limit(telegram_id: int) -> int:
     return FREE_GENERATIONS + purchased
 
 
+def is_subscribed(telegram_id: int) -> bool:
+    row = get_user(telegram_id)
+    if not row or not row["subscription_until"]:
+        return False
+    try:
+        return datetime.fromisoformat(row["subscription_until"]) > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def extend_subscription(telegram_id: int, days: int = 30):
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT subscription_until FROM users WHERE telegram_id=?", (telegram_id,)
+    ).fetchone()
+    now = datetime.now(timezone.utc)
+    current = None
+    if row and row["subscription_until"]:
+        try:
+            current = datetime.fromisoformat(row["subscription_until"])
+        except Exception:
+            current = None
+    base = current if current and current > now else now
+    new_until = (base + timedelta(days=days)).isoformat()
+    conn.execute(
+        "UPDATE users SET subscription_until=? WHERE telegram_id=?", (new_until, telegram_id)
+    )
+    conn.commit()
+    conn.close()
+    return new_until
+
+
 # ---------------------------------------------------------------------------
 # /start, /help
 # ---------------------------------------------------------------------------
 
 WELCOME = (
-    "Welcome to *Attestly* \\- EU AI Act compliance, generated from what your "
+    "\U0001f916 *Attestly* \\- EU AI Act compliance, generated from what your "
     "AI agents already do\\.\n\n"
-    "Here's what I can do:\n"
-    "/riskcheck \\- free EU AI Act risk classification for your AI system\n"
-    "/generate \\- upload a trace file, get a drafted Annex IV section back as a docx\n"
-    "/status \\- see your saved risk result and remaining free generations\n"
-    "/buy \\- purchase extra doc\\-generations \\(Telegram Stars or card\\)\n"
-    "/upgrade \\- see paid plans on attestly\\.online\n\n"
-    "In groups, I also answer questions about Attestly and the EU AI Act "
-    "automatically, filter non\\-attestly\\.online links, and \\(for admins\\) "
-    "support /ban, /unban, /kick, /mute, /unmute, /promote, /demote, /pin, "
-    "/unpin, and /purge by replying to a user's message\\.\n\n"
-    "/cleanservice on\\|off \\(admins\\) \\- toggle auto\\-cleanup of join notices "
-    "and command clutter\\.\n\n"
-    "/announce \\(channel admins only\\) \\- post an update to the Attestly channel\\.\n"
+    "Free risk checks, drafted Annex IV documentation, and answers on the EU "
+    "AI Act \\- right here in Telegram\\.\n\n"
+    "Pick an option below, or just ask a question\\."
 )
+
+ADMIN_INFO_TEXT = (
+    "\U0001f6e1 Group admin toolkit\n\n"
+    "In groups, I automatically answer questions about Attestly and the EU AI Act, "
+    "filter links that aren't to attestly.online, and (for group admins) support:\n\n"
+    "/ban, /unban, /kick, /mute, /unmute, /promote, /demote, /pin, /unpin \u2014 "
+    "all by replying to a user's message\n"
+    "/purge \u2014 reply to bulk-delete from there to now, or /purge <N>\n"
+    "/cleanservice on|off \u2014 toggle auto-cleanup of join notices and command clutter\n"
+    "/announce <text> \u2014 (channel admins) post to the Attestly channel"
+)
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f50d Risk Check", callback_data="menu_riskcheck"),
+         InlineKeyboardButton("\U0001f4c4 Generate", callback_data="menu_generate")],
+        [InlineKeyboardButton("\U0001f4ca Status", callback_data="menu_status"),
+         InlineKeyboardButton("\u2b50 Upgrade to Pro", callback_data="menu_upgrade")],
+        [InlineKeyboardButton("\U0001f6e1 Admin Commands", callback_data="menu_admin")],
+        [InlineKeyboardButton("\U0001f310 attestly.online", url="https://www.attestly.online")],
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     upsert_user(user.id, user.username)
-    await update.message.reply_markdown_v2(WELCOME)
+    await update.message.reply_markdown_v2(WELCOME, reply_markup=main_menu_keyboard())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown_v2(WELCOME)
+    await update.message.reply_markdown_v2(WELCOME, reply_markup=main_menu_keyboard())
+
+
+async def menu_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await context.bot.send_message(query.message.chat_id, ADMIN_INFO_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -273,16 +325,26 @@ def yn_keyboard():
     )
 
 
+RISKCHECK_Q1 = (
+    "\U0001f50d EU AI Act Risk Check \u2014 4 quick questions.\n\n"
+    "1) Does your system do any of the following: subliminal manipulation, "
+    "social scoring, real-time remote biometric identification by law "
+    "enforcement in public spaces, or emotion recognition in workplaces "
+    "or schools?"
+)
+
+
 async def riskcheck_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["risk_answers"] = {}
-    await update.message.reply_text(
-        "EU AI Act Risk Check \u2014 4 quick questions.\n\n"
-        "1) Does your system do any of the following: subliminal manipulation, "
-        "social scoring, real-time remote biometric identification by law "
-        "enforcement in public spaces, or emotion recognition in workplaces "
-        "or schools?",
-        reply_markup=yn_keyboard(),
-    )
+    await update.message.reply_text(RISKCHECK_Q1, reply_markup=yn_keyboard())
+    return Q_PROHIBITED
+
+
+async def riskcheck_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["risk_answers"] = {}
+    await context.bot.send_message(query.message.chat_id, RISKCHECK_Q1, reply_markup=yn_keyboard())
     return Q_PROHIBITED
 
 
@@ -393,52 +455,90 @@ async def finish_riskcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+async def send_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user):
     upsert_user(user.id, user.username)
     row = get_user(user.id)
     risk = row["risk_result"] if row and row["risk_result"] else "not checked yet \u2014 run /riskcheck"
     used = row["generations_used"] if row else 0
-    limit = get_generation_limit(user.id)
-    remaining = max(limit - used, 0)
-    await update.message.reply_text(
-        f"Risk classification: {risk}\n"
-        f"Doc-generations remaining: {remaining}/{limit}\n\n"
-        f"Full account + history: {LOGIN_URL}\n"
-        "Need more? /buy"
+
+    if is_subscribed(user.id):
+        until = datetime.fromisoformat(row["subscription_until"]).strftime("%b %d, %Y")
+        plan_line = f"\u2b50 Pro \u2014 unlimited generations (renews/expires {until})"
+    else:
+        limit = get_generation_limit(user.id)
+        remaining = max(limit - used, 0)
+        plan_line = f"\U0001f193 Free \u2014 {remaining}/{limit} generations remaining"
+
+    await context.bot.send_message(
+        chat_id,
+        f"\U0001f4ca *Your Attestly status*\n\n"
+        f"Plan: {plan_line}\n"
+        f"Risk classification: {risk}\n\n"
+        f"Full account + history: {LOGIN_URL}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("\u2b50 Upgrade to Pro", callback_data="menu_upgrade"),
+             InlineKeyboardButton("\U0001f4b0 Buy generations", callback_data="menu_buy")]
+        ]),
     )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_status(context, update.effective_chat.id, update.effective_user)
+
+
+async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_status(context, query.message.chat_id, query.from_user)
 
 
 # ---------------------------------------------------------------------------
 # /generate - upload trace JSON -> drafted Annex IV paragraph -> docx
 # ---------------------------------------------------------------------------
 
+GENERATE_PROMPT_TEXT = (
+    "Send me a trace file as a JSON document (OpenTelemetry, LangSmith, "
+    "AgentOps export, or plain normalized JSON with tool_call / "
+    "human_intervention / error / deployment_change events)."
+)
 
-async def generate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+
+async def send_generate_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user):
     upsert_user(user.id, user.username)
     row = get_user(user.id)
     used = row["generations_used"] if row else 0
 
-    if used >= get_generation_limit(user.id):
-        await update.message.reply_text(
-            "You've used all your doc-generations.\n"
-            f"Buy more with /buy, or see paid plans here: {PRICING_URL}"
+    if not is_subscribed(user.id) and used >= get_generation_limit(user.id):
+        await context.bot.send_message(
+            chat_id,
+            "You've used all your doc-generations.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2b50 Upgrade to Pro", callback_data="menu_upgrade"),
+                 InlineKeyboardButton("\U0001f4b0 Buy generations", callback_data="menu_buy")]
+            ]),
         )
         return
 
     if not ANTHROPIC_API_KEY or Anthropic is None:
-        await update.message.reply_text(
+        await context.bot.send_message(
+            chat_id,
             "Doc generation isn't configured on this bot yet (missing API key). "
-            f"In the meantime, use the full tool at {LOGIN_URL}"
+            f"In the meantime, use the full tool at {LOGIN_URL}",
         )
         return
 
-    await update.message.reply_text(
-        "Send me a trace file as a JSON document (OpenTelemetry, LangSmith, "
-        "AgentOps export, or plain normalized JSON with tool_call / "
-        "human_intervention / error / deployment_change events)."
-    )
+    await context.bot.send_message(chat_id, GENERATE_PROMPT_TEXT)
+
+
+async def generate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_generate_prompt(context, update.effective_chat.id, update.effective_user)
+
+
+async def generate_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_generate_prompt(context, query.message.chat_id, query.from_user)
 
 
 async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,9 +546,14 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
     row = get_user(user.id)
     used = row["generations_used"] if row else 0
     limit = get_generation_limit(user.id)
-    if used >= limit:
+    subscribed = is_subscribed(user.id)
+    if not subscribed and used >= limit:
         await update.message.reply_text(
-            f"You've used all your doc-generations. Buy more with /buy, or see plans: {PRICING_URL}"
+            "You've used all your doc-generations. Try /buy or /upgrade.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u2b50 Upgrade to Pro", callback_data="menu_upgrade"),
+                 InlineKeyboardButton("\U0001f4b0 Buy generations", callback_data="menu_buy")]
+            ]),
         )
         return
 
@@ -465,7 +570,7 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("That file isn't valid JSON \u2014 please check and resend.")
         return
 
-    await update.message.reply_text("Drafting your Annex IV section\u2026 one moment.")
+    await update.message.reply_text("\u2699\ufe0f Drafting your Annex IV section\u2026 one moment.")
 
     try:
         drafted = draft_annex_iv_section(trace_events)
@@ -476,17 +581,19 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
 
     docx_path = build_docx(drafted, trace_events)
     used_after = increment_generations(user.id)
-    remaining_after = max(limit - used_after, 0)
+    caption = "\u2705 Drafted section attached."
+    if subscribed:
+        caption += " (Pro plan \u2014 unlimited)"
+    else:
+        remaining_after = max(limit - used_after, 0)
+        caption += f" Generations left: {remaining_after}/{limit}."
+    caption += f" Full account + more sections: {LOGIN_URL}"
 
     with open(docx_path, "rb") as f:
         await update.message.reply_document(
             document=f,
             filename="annex_iv_draft.docx",
-            caption=(
-                f"Drafted section attached. Generations left: "
-                f"{remaining_after}/{limit}. "
-                f"Full account + more sections: {LOGIN_URL}"
-            ),
+            caption=caption,
         )
     os.remove(docx_path)
 
@@ -1189,12 +1296,15 @@ async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------------------------------------------------------------
 # /buy: generation packs via Telegram Stars (instant, no setup) or Ammer Pay (USD)
+# /upgrade: monthly Pro subscription (Telegram Stars \u2014 recurring subscriptions
+# are Stars-only on Telegram's platform, fiat providers don't support them)
 # ---------------------------------------------------------------------------
 
+SUBSCRIPTION_PRICE_STARS = int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "4250"))  # ~$85/mo estimate
+SUBSCRIPTION_PERIOD_SECONDS = 2592000  # 30 days, Telegram's standard monthly subscription period
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    upsert_user(user.id, user.username)
+
+def buy_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(
             f"\u2b50 {GENERATION_PACK_STARS} Stars \u2014 {GENERATION_PACK_SIZE} generations",
@@ -1206,10 +1316,27 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001f4b3 ${GENERATION_PACK_USD_CENTS/100:.2f} \u2014 {GENERATION_PACK_SIZE} generations",
             callback_data="buy_fiat",
         )])
-    await update.message.reply_text(
-        f"Get {GENERATION_PACK_SIZE} more Annex IV generations:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    return InlineKeyboardMarkup(buttons)
+
+
+async def send_buy_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    await context.bot.send_message(
+        chat_id,
+        f"\U0001f4b0 Get {GENERATION_PACK_SIZE} more Annex IV generations:",
+        reply_markup=buy_keyboard(),
     )
+
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    upsert_user(user.id, user.username)
+    await send_buy_menu(context, update.effective_chat.id)
+
+
+async def buy_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_buy_menu(context, query.message.chat_id)
 
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1246,28 +1373,63 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
-    # No inventory/stock to check for a digital generation pack \u2014 always approve.
+    # No inventory/stock to check for a digital generation pack or subscription \u2014 always approve.
     await query.answer(ok=True)
 
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
     user = update.effective_user
-    add_purchased_generations(user.id, GENERATION_PACK_SIZE)
-    method = "Stars" if payment.currency == "XTR" else payment.currency
-    await update.message.reply_text(
-        f"Payment received ({method}) \u2014 {GENERATION_PACK_SIZE} generations added to your account. "
-        "Check /status or run /generate now."
-    )
+
+    if payment.invoice_payload == "attestly_pro_monthly":
+        new_until = extend_subscription(user.id, days=30)
+        until_str = datetime.fromisoformat(new_until).strftime("%b %d, %Y")
+        await update.message.reply_text(
+            f"\u2b50 Welcome to Attestly Pro! Unlimited generations active until {until_str}. "
+            "Manage or cancel anytime in Telegram Settings \u2192 My Subscriptions."
+        )
+    else:
+        add_purchased_generations(user.id, GENERATION_PACK_SIZE)
+        method = "Stars" if payment.currency == "XTR" else payment.currency
+        await update.message.reply_text(
+            f"\u2705 Payment received ({method}) \u2014 {GENERATION_PACK_SIZE} generations added. "
+            "Check /status or run /generate now."
+        )
 
 
 # ---------------------------------------------------------------------------
 # /upgrade
 # ---------------------------------------------------------------------------
 
+UPGRADE_TEXT = (
+    "\u2b50 *Attestly Pro* \u2014 unlimited Annex IV generations for one AI system, "
+    f"~${SUBSCRIPTION_PRICE_STARS * 0.02:.0f}/month, billed monthly in Telegram Stars.\n\n"
+    "Multiple AI systems still need separate plans \u2014 this covers one system, unlimited traces."
+)
+
+
+async def send_upgrade_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    await context.bot.send_message(chat_id, UPGRADE_TEXT, parse_mode="Markdown")
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title="Attestly Pro (Monthly)",
+        description="Unlimited Annex IV doc-generations for one AI system, billed monthly.",
+        payload="attestly_pro_monthly",
+        provider_token="",  # Stars only \u2014 Telegram doesn't support recurring subscriptions via fiat providers
+        currency="XTR",
+        prices=[LabeledPrice("Attestly Pro (Monthly)", SUBSCRIPTION_PRICE_STARS)],
+        subscription_period=SUBSCRIPTION_PERIOD_SECONDS,
+    )
+
 
 async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"See paid plans here: {PRICING_URL}")
+    await send_upgrade_invoice(context, update.effective_chat.id)
+
+
+async def upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_upgrade_invoice(context, query.message.chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1297,6 +1459,11 @@ def main():
     app.add_handler(CommandHandler("cleanservice", cleanservice_toggle))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_"))
+    app.add_handler(CallbackQueryHandler(menu_admin_button, pattern="^menu_admin$"))
+    app.add_handler(CallbackQueryHandler(status_button, pattern="^menu_status$"))
+    app.add_handler(CallbackQueryHandler(generate_button, pattern="^menu_generate$"))
+    app.add_handler(CallbackQueryHandler(upgrade_button, pattern="^menu_upgrade$"))
+    app.add_handler(CallbackQueryHandler(buy_button, pattern="^menu_buy$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, generate_receive_file))
@@ -1312,7 +1479,10 @@ def main():
     )
 
     riskcheck_conv = ConversationHandler(
-        entry_points=[CommandHandler("riskcheck", riskcheck_start)],
+        entry_points=[
+            CommandHandler("riskcheck", riskcheck_start),
+            CallbackQueryHandler(riskcheck_start_button, pattern="^menu_riskcheck$"),
+        ],
         states={
             Q_PROHIBITED: [CallbackQueryHandler(q_prohibited)],
             Q_HIGH_RISK: [CallbackQueryHandler(q_high_risk)],
