@@ -640,6 +640,13 @@ async def generate_receive_file(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Please send a .json trace file.")
         return
 
+    if not ANTHROPIC_API_KEY or Anthropic is None:
+        await update.message.reply_text(
+            "Doc generation isn't configured on this bot yet (missing API key). "
+            f"In the meantime, use the full tool at {LOGIN_URL}"
+        )
+        return
+
     tg_file = await doc.get_file()
     raw = await tg_file.download_as_bytearray()
     try:
@@ -1381,7 +1388,6 @@ async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
 SUBSCRIPTION_PRICE_STARS = min(
     int(os.environ.get("SUBSCRIPTION_PRICE_STARS", "2500")), 2500
 )  # Telegram enforces a hard 2500-Star cap on any single subscription \u2014 this is the max possible
-SUBSCRIPTION_PERIOD_SECONDS = 2592000  # 30 days, Telegram's standard monthly subscription period
 
 
 def buy_keyboard() -> InlineKeyboardMarkup:
@@ -1467,7 +1473,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         until_str = datetime.fromisoformat(new_until).strftime("%b %d, %Y")
         await update.message.reply_text(
             f"\u2b50 Welcome to Attestly Pro! Unlimited generations active until {until_str}. "
-            "Manage or cancel anytime in Telegram Settings \u2192 My Subscriptions."
+            "This won't auto-renew \u2014 run /upgrade again in 30 days to continue."
         )
     else:
         log_payment(user.id, user.username, "generation_pack", payment.currency, payment.total_amount)
@@ -1487,17 +1493,17 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 async def send_upgrade_invoice(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     await context.bot.send_invoice(
         chat_id=chat_id,
-        title="Attestly Pro (Monthly)",
+        title="Attestly Pro (30 Days)",
         description=(
-            f"Unlimited Annex IV documentation for one AI system, billed monthly "
-            f"in Telegram Stars ({SUBSCRIPTION_PRICE_STARS} Stars \u2014 Telegram's "
-            f"maximum for any subscription). Multiple AI systems need separate plans."
+            f"Unlimited Annex IV documentation for one AI system, for 30 days "
+            f"({SUBSCRIPTION_PRICE_STARS} Stars, one-time \u2014 not auto-renewing; "
+            f"run /upgrade again after 30 days to continue). Multiple AI systems "
+            f"need separate plans."
         ),
         payload="attestly_pro_monthly",
-        provider_token="",  # Stars only \u2014 Telegram doesn't support recurring subscriptions via fiat providers
+        provider_token="",  # Stars only
         currency="XTR",
-        prices=[LabeledPrice("Attestly Pro (Monthly)", SUBSCRIPTION_PRICE_STARS)],
-        subscription_period=SUBSCRIPTION_PERIOD_SECONDS,
+        prices=[LabeledPrice("Attestly Pro (30 Days)", SUBSCRIPTION_PRICE_STARS)],
     )
 
 
