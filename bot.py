@@ -169,6 +169,17 @@ def db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcast_channels (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            chat_type TEXT,
+            active INTEGER DEFAULT 1,
+            updated_at TEXT
+        )
+        """
+    )
     return conn
 
 
@@ -340,6 +351,42 @@ def find_user_by_username(username: str):
     return row["telegram_id"] if row else None
 
 
+def upsert_broadcast_channel(chat_id: int, title: str, chat_type: str, active: bool):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO broadcast_channels (chat_id, title, chat_type, active, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title=excluded.title, chat_type=excluded.chat_type,
+            active=excluded.active, updated_at=excluded.updated_at
+        """,
+        (chat_id, title, chat_type, int(active), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_broadcast_targets():
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT chat_id, title, chat_type FROM broadcast_channels WHERE active=1"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def list_all_broadcast_channels():
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT chat_id, title, chat_type, active FROM broadcast_channels ORDER BY title"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # /start, /help
 # ---------------------------------------------------------------------------
@@ -360,7 +407,7 @@ ADMIN_INFO_TEXT = (
     "all by replying to a user's message\n"
     "/purge \u2014 reply to bulk-delete from there to now, or /purge <N>\n"
     "/cleanservice on|off \u2014 toggle auto-cleanup of join notices and command clutter\n"
-    "/announce <text> \u2014 (channel admins) post to the Attestly channel"
+    "/registerchat \u2014 register this chat so the Attestly team can broadcast updates here"
 )
 
 
@@ -741,6 +788,64 @@ async def is_bot_admin_here(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
         return member.status in ("administrator", "creator")
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Broadcast registry: which chats /announce can reach.
+# Telegram gives bots no way to list every chat they're in, so we track it
+# ourselves: automatically going forward (my_chat_member events fire whenever
+# the bot is added/promoted/removed/demoted anywhere), and via /registerchat
+# once per chat to backfill anything the bot already administered before
+# this feature existed.
+# ---------------------------------------------------------------------------
+
+
+def _member_can_broadcast(chat_type: str, member) -> bool:
+    status = member.status
+    if status == "creator":
+        return True
+    if status != "administrator":
+        return False
+    if chat_type == "channel":
+        return bool(getattr(member, "can_post_messages", False))
+    return True  # in groups/supergroups, admin status is enough to send messages
+
+
+async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.my_chat_member
+    chat = cmu.chat
+    active = _member_can_broadcast(chat.type, cmu.new_chat_member)
+    upsert_broadcast_channel(chat.id, chat.title or chat.username or str(chat.id), chat.type, active)
+
+
+async def register_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run once inside any existing group/channel to backfill it into the
+    broadcast list \u2014 only needed for chats the bot administered before this
+    feature shipped. New chats register themselves automatically."""
+    chat = update.effective_chat
+    requester = update.effective_user
+    if chat.type == "private":
+        await update.message.reply_text("Run this inside the group or channel you want to register.")
+        return
+    if not (is_bot_owner(requester.id) or await is_group_admin(context, chat.id, requester.id)):
+        await update.message.reply_text("Only an admin of this chat (or the bot owner) can register it.")
+        return
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat.id, me.id)
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't check my own permissions here: {e}")
+        return
+    active = _member_can_broadcast(chat.type, member)
+    upsert_broadcast_channel(chat.id, chat.title or chat.username or str(chat.id), chat.type, active)
+    if active:
+        await update.message.reply_text("Registered \u2014 /announce will now reach this chat.")
+    else:
+        await update.message.reply_text(
+            "I don't have posting rights here yet. Make me an admin with "
+            + ("'Post Messages'" if chat.type == "channel" else "posting ability")
+            + " and run /registerchat again."
+        )
 
 
 async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: float):
@@ -1292,32 +1397,94 @@ def build_hashtags(text: str) -> str:
     return " ".join(dict.fromkeys(tags))  # de-dupe, keep order
 
 
+def _strip_announce_prefix(raw: str) -> str:
+    """Turns '/announce hello' or '/announce@Attestly_bot hello' into 'hello'."""
+    parts = (raw or "").split(None, 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+async def _send_to_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message, caption: str):
+    """Sends message's attached media (if any) plus caption to chat_id, or
+    just the text if there's no media. Reuses the original file_id, so the
+    same photo/video/etc. doesn't need re-uploading per target chat."""
+    if message.photo:
+        await context.bot.send_photo(chat_id, message.photo[-1].file_id, caption=caption or None)
+    elif message.video:
+        await context.bot.send_video(chat_id, message.video.file_id, caption=caption or None)
+    elif message.animation:
+        await context.bot.send_animation(chat_id, message.animation.file_id, caption=caption or None)
+    elif message.audio:
+        await context.bot.send_audio(chat_id, message.audio.file_id, caption=caption or None)
+    elif message.voice:
+        await context.bot.send_voice(chat_id, message.voice.file_id, caption=caption or None)
+    elif message.document:
+        await context.bot.send_document(chat_id, message.document.file_id, caption=caption or None)
+    else:
+        if not caption:
+            raise ValueError("nothing to send")
+        await context.bot.send_message(chat_id, caption)
+
+
 async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM this to the bot: /announce <text>. Posts to ANNOUNCE_CHANNEL_ID if the
-    requester is an admin of that channel. Works today, independent of the watcher."""
-    if not ANNOUNCE_CHANNEL_ID:
-        await update.message.reply_text("No announcement channel is configured (ANNOUNCE_CHANNEL_ID).")
-        return
+    """Bot-owner only. /announce <text>, or attach a photo/video/audio/document
+    with a caption starting with /announce <text> \u2014 broadcasts to every
+    group/channel the bot administers with posting rights (see /registerchat
+    for backfilling chats the bot already administered before this existed)."""
     requester = update.effective_user
-    if not await is_group_admin(context, ANNOUNCE_CHANNEL_ID, requester.id):
+    if not is_bot_owner(requester.id):
+        return  # silent \u2014 don't reveal this command to non-owners
+    message = update.message
+
+    raw = message.text if message.text else (message.caption or "")
+    text = _strip_announce_prefix(raw).strip()
+    has_media = bool(
+        message.photo or message.video or message.animation
+        or message.audio or message.voice or message.document
+    )
+    if not text and not has_media:
         await update.message.reply_text(
-            "Only admins of the announcement channel can use /announce."
+            "Usage: /announce <text>, or attach a photo/video/audio/document "
+            "with /announce <text> as the caption."
         )
         return
-    text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Usage: /announce <your update text>")
-        return
-    try:
-        await context.bot.send_message(
-            ANNOUNCE_CHANNEL_ID, f"{text}\n\n{build_hashtags(text)}"
-        )
-        await update.message.reply_text("Posted to the channel.")
-    except Exception as e:
+
+    caption = f"{text}\n\n{build_hashtags(text)}" if text else ""
+    targets = get_broadcast_targets()
+    if not targets:
         await update.message.reply_text(
-            f"Couldn't post to the channel: {e}\n"
-            "Make sure the bot is an admin of the channel with 'Post Messages' permission."
+            "No chats registered yet. Run /registerchat inside each group/channel "
+            "you want Attestly to broadcast to (new ones register automatically "
+            "once the bot is made admin there)."
         )
+        return
+
+    sent, failed = 0, 0
+    for row in targets:
+        try:
+            await _send_to_chat(context, row["chat_id"], message, caption)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.warning(f"announce failed for {row['chat_id']} ({row['title']}): {e}")
+
+    summary = f"Announced to {sent} chat(s)."
+    if failed:
+        summary += f" {failed} failed (bot may have lost admin rights there)."
+    await update.message.reply_text(summary)
+
+
+async def list_broadcast_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_owner(update.effective_user.id):
+        return
+    rows = list_all_broadcast_channels()
+    if not rows:
+        await update.message.reply_text("No chats registered yet.")
+        return
+    lines = [
+        f"{'\u2705' if r['active'] else '\u26a0\ufe0f'} {r['title']} ({r['chat_type']}, id {r['chat_id']})"
+        for r in rows
+    ]
+    await update.message.reply_text("Broadcast list:\n" + "\n".join(lines))
 
 
 def get_watch_hash(url: str):
@@ -1358,9 +1525,13 @@ def fetch_page_hash(url: str) -> str | None:
 
 async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
     """Runs on a schedule. For each WATCH_URLS entry: if its content changed since
-    last check, post an alert to ANNOUNCE_CHANNEL_ID. First-ever check on a URL just
-    records a baseline (no post), so adding a new URL doesn't trigger a false alert."""
-    if not WATCH_URLS or not ANNOUNCE_CHANNEL_ID:
+    last check, broadcast an alert to every registered chat. First-ever check on
+    a URL just records a baseline (no post), so adding a new URL doesn't trigger
+    a false alert."""
+    if not WATCH_URLS:
+        return
+    targets = get_broadcast_targets()
+    if not targets:
         return
     for url in WATCH_URLS:
         new_hash = fetch_page_hash(url)
@@ -1372,11 +1543,13 @@ async def check_for_updates(context: ContextTypes.DEFAULT_TYPE):
             continue
         if new_hash != old_hash:
             set_watch_hash(url, new_hash)
-            try:
-                text = f"Attestly update \u2014 something changed here:\n{url}"
-                await context.bot.send_message(ANNOUNCE_CHANNEL_ID, f"{text}\n\n{build_hashtags(text)}")
-            except Exception as e:
-                log.warning(f"couldn't post site-watch update: {e}")
+            text = f"Attestly update \u2014 something changed here:\n{url}"
+            caption = f"{text}\n\n{build_hashtags(text)}"
+            for row in targets:
+                try:
+                    await context.bot.send_message(row["chat_id"], caption)
+                except Exception as e:
+                    log.warning(f"couldn't post site-watch update to {row['chat_id']}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1636,10 +1809,12 @@ GROUP_ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("unpin", "Unpin a message"),
     BotCommand("purge", "Bulk-delete messages"),
     BotCommand("cleanservice", "Toggle auto-cleanup of clutter"),
-    BotCommand("announce", "Post an update to the Attestly channel"),
+    BotCommand("registerchat", "Register this chat for /announce broadcasts"),
 ]
 
 OWNER_COMMANDS = GROUP_ADMIN_COMMANDS + [
+    BotCommand("announce", "Broadcast text/media to every registered chat"),
+    BotCommand("broadcastlist", "See every chat registered for /announce"),
     BotCommand("adminpanel", "Bot stats, earnings, users"),
     BotCommand("grantpro", "Manually grant a user Pro"),
 ]
@@ -1653,6 +1828,18 @@ async def setup_command_menus(app: Application):
             await app.bot.set_my_commands(OWNER_COMMANDS, scope=BotCommandScopeChat(chat_id=owner_id))
         except Exception as e:
             log.warning(f"couldn't set owner command menu for {owner_id}: {e}")
+
+    # Seed the channel we already know the bot administers, so it's included
+    # in broadcasts immediately without needing a manual /registerchat there.
+    if ANNOUNCE_CHANNEL_ID:
+        try:
+            chat = await app.bot.get_chat(ANNOUNCE_CHANNEL_ID)
+            me = await app.bot.get_me()
+            member = await app.bot.get_chat_member(chat.id, me.id)
+            active = _member_can_broadcast(chat.type, member)
+            upsert_broadcast_channel(chat.id, chat.title or chat.username or str(chat.id), chat.type, active)
+        except Exception as e:
+            log.warning(f"couldn't seed {ANNOUNCE_CHANNEL_ID} into broadcast list: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1678,6 +1865,12 @@ def main():
     app.add_handler(CommandHandler("pin", pin_message))
     app.add_handler(CommandHandler("unpin", unpin_message))
     app.add_handler(CommandHandler("announce", announce))
+    app.add_handler(
+        MessageHandler(filters.CAPTION & filters.CaptionRegex(r"(?i)^/announce(@\w+)?(\s|$)"), announce)
+    )
+    app.add_handler(CommandHandler("registerchat", register_chat))
+    app.add_handler(CommandHandler("broadcastlist", list_broadcast_chats))
+    app.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("purge", purge_messages))
     app.add_handler(CommandHandler("cleanservice", cleanservice_toggle))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
@@ -1718,11 +1911,11 @@ def main():
     )
     app.add_handler(riskcheck_conv)
 
-    if WATCH_URLS and ANNOUNCE_CHANNEL_ID:
+    if WATCH_URLS:
         app.job_queue.run_repeating(
             check_for_updates, interval=WATCH_INTERVAL_HOURS * 3600, first=60
         )
-        log.info(f"Site watcher enabled for {WATCH_URLS} -> {ANNOUNCE_CHANNEL_ID}")
+        log.info(f"Site watcher enabled for {WATCH_URLS} -> all registered chats")
     else:
         log.info("Site watcher disabled (no WATCH_URLS configured yet)")
 
