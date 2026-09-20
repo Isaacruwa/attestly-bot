@@ -9,7 +9,7 @@ Commands:
   /upgrade    - link to attestly.online/pricing once free limit is hit
   /help       - list commands
 
-Storage: local SQLite (attestly_bot.db) - one row per Telegram user.
+Storage: Neon (Postgres) via DATABASE_URL - persists across deploys/restarts.
 """
 
 import os
@@ -19,12 +19,13 @@ import time
 import json
 import hashlib
 import logging
-import sqlite3
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
+import psycopg2
+import psycopg2.extras
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -62,7 +63,7 @@ except ImportError:
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # only needed for /generate
-DB_PATH = os.environ.get("ATTESTLY_BOT_DB", "attestly_bot.db")
+DATABASE_URL = os.environ["DATABASE_URL"]  # Neon Postgres connection string
 PRICING_URL = "https://www.attestly.online/pricing"
 LOGIN_URL = "https://www.attestly.online/login"
 FREE_GENERATIONS = 3  # free docx drafts per user before we point them to pricing
@@ -119,16 +120,20 @@ log = logging.getLogger("attestly-bot")
 Q_PROHIBITED, Q_HIGH_RISK, Q_GPAI, Q_TRANSPARENCY = range(4)
 
 # ---------------------------------------------------------------------------
-# Storage
+# Storage (Neon/Postgres). Every helper opens its own short-lived connection,
+# same pattern as before - simple and fine at this scale. Tables are created
+# once outside the app (see repo README); this just guards against a fresh
+# database with CREATE TABLE IF NOT EXISTS, identical syntax to Postgres.
 # ---------------------------------------------------------------------------
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             username TEXT,
             risk_result TEXT,
             risk_checked_at TEXT,
@@ -139,7 +144,7 @@ def db():
         )
         """
     )
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS site_watch (
             url TEXT PRIMARY KEY,
@@ -148,19 +153,19 @@ def db():
         )
         """
     )
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_settings (
-            chat_id INTEGER PRIMARY KEY,
+            chat_id BIGINT PRIMARY KEY,
             clean_service INTEGER DEFAULT 1
         )
         """
     )
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT,
             username TEXT,
             kind TEXT,
             currency TEXT,
@@ -169,10 +174,10 @@ def db():
         )
         """
     )
-    conn.execute(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS broadcast_channels (
-            chat_id INTEGER PRIMARY KEY,
+            chat_id BIGINT PRIMARY KEY,
             title TEXT,
             chat_type TEXT,
             active INTEGER DEFAULT 1,
@@ -180,25 +185,31 @@ def db():
         )
         """
     )
+    conn.commit()
+    cur.close()
     return conn
+
+
+def dict_cur(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def get_clean_service(chat_id: int) -> bool:
     conn = db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT clean_service FROM chat_settings WHERE chat_id=?", (chat_id,)
-    ).fetchone()
+    cur = dict_cur(conn)
+    cur.execute("SELECT clean_service FROM chat_settings WHERE chat_id=%s", (chat_id,))
+    row = cur.fetchone()
     conn.close()
     return bool(row["clean_service"]) if row else True  # on by default
 
 
 def set_clean_service(chat_id: int, enabled: bool):
     conn = db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
-        INSERT INTO chat_settings (chat_id, clean_service) VALUES (?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET clean_service=excluded.clean_service
+        INSERT INTO chat_settings (chat_id, clean_service) VALUES (%s, %s)
+        ON CONFLICT(chat_id) DO UPDATE SET clean_service=EXCLUDED.clean_service
         """,
         (chat_id, int(enabled)),
     )
@@ -208,11 +219,12 @@ def set_clean_service(chat_id: int, enabled: bool):
 
 def upsert_user(telegram_id: int, username: str | None):
     conn = db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         INSERT INTO users (telegram_id, username, generations_used, created_at)
-        VALUES (?, ?, 0, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username
+        VALUES (%s, %s, 0, %s)
+        ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username
         """,
         (telegram_id, username, datetime.now(timezone.utc).isoformat()),
     )
@@ -222,43 +234,43 @@ def upsert_user(telegram_id: int, username: str | None):
 
 def save_risk_result(telegram_id: int, result: str):
     conn = db()
-    conn.execute(
-        "UPDATE users SET risk_result=?, risk_checked_at=? WHERE telegram_id=?",
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET risk_result=%s, risk_checked_at=%s WHERE telegram_id=%s",
         (result, datetime.now(timezone.utc).isoformat(), telegram_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_user(telegram_id: int) -> sqlite3.Row | None:
+def get_user(telegram_id: int):
     conn = db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM users WHERE telegram_id=?", (telegram_id,)
-    ).fetchone()
+    cur = dict_cur(conn)
+    cur.execute("SELECT * FROM users WHERE telegram_id=%s", (telegram_id,))
+    row = cur.fetchone()
     conn.close()
     return row
 
 
 def increment_generations(telegram_id: int) -> int:
     conn = db()
-    conn.execute(
-        "UPDATE users SET generations_used = generations_used + 1 WHERE telegram_id=?",
+    cur = dict_cur(conn)
+    cur.execute(
+        "UPDATE users SET generations_used = generations_used + 1 WHERE telegram_id=%s",
         (telegram_id,),
     )
+    cur.execute("SELECT generations_used FROM users WHERE telegram_id=%s", (telegram_id,))
+    row = cur.fetchone()
     conn.commit()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT generations_used FROM users WHERE telegram_id=?", (telegram_id,)
-    ).fetchone()
     conn.close()
     return row["generations_used"]
 
 
 def add_purchased_generations(telegram_id: int, n: int):
     conn = db()
-    conn.execute(
-        "UPDATE users SET purchased_generations = purchased_generations + ? WHERE telegram_id=?",
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET purchased_generations = purchased_generations + %s WHERE telegram_id=%s",
         (n, telegram_id),
     )
     conn.commit()
@@ -283,10 +295,9 @@ def is_subscribed(telegram_id: int) -> bool:
 
 def extend_subscription(telegram_id: int, days: int = 30):
     conn = db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT subscription_until FROM users WHERE telegram_id=?", (telegram_id,)
-    ).fetchone()
+    cur = dict_cur(conn)
+    cur.execute("SELECT subscription_until FROM users WHERE telegram_id=%s", (telegram_id,))
+    row = cur.fetchone()
     now = datetime.now(timezone.utc)
     current = None
     if row and row["subscription_until"]:
@@ -296,8 +307,8 @@ def extend_subscription(telegram_id: int, days: int = 30):
             current = None
     base = current if current and current > now else now
     new_until = (base + timedelta(days=days)).isoformat()
-    conn.execute(
-        "UPDATE users SET subscription_until=? WHERE telegram_id=?", (new_until, telegram_id)
+    cur.execute(
+        "UPDATE users SET subscription_until=%s WHERE telegram_id=%s", (new_until, telegram_id)
     )
     conn.commit()
     conn.close()
@@ -306,9 +317,10 @@ def extend_subscription(telegram_id: int, days: int = 30):
 
 def log_payment(telegram_id: int, username: str | None, kind: str, currency: str, amount: int):
     conn = db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         "INSERT INTO payments (telegram_id, username, kind, currency, amount, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s)",
         (telegram_id, username, kind, currency, amount, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
@@ -317,20 +329,22 @@ def log_payment(telegram_id: int, username: str | None, kind: str, currency: str
 
 def get_admin_stats():
     conn = db()
-    conn.row_factory = sqlite3.Row
-    total_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    cur = dict_cur(conn)
+    cur.execute("SELECT COUNT(*) c FROM users")
+    total_users = cur.fetchone()["c"]
     now_iso = datetime.now(timezone.utc).isoformat()
-    pro_count = conn.execute(
-        "SELECT COUNT(*) c FROM users WHERE subscription_until IS NOT NULL AND subscription_until > ?",
+    cur.execute(
+        "SELECT COUNT(*) c FROM users WHERE subscription_until IS NOT NULL AND subscription_until > %s",
         (now_iso,),
-    ).fetchone()["c"]
-    earnings = conn.execute(
-        "SELECT currency, SUM(amount) total, COUNT(*) n FROM payments GROUP BY currency"
-    ).fetchall()
-    users = conn.execute(
+    )
+    pro_count = cur.fetchone()["c"]
+    cur.execute("SELECT currency, SUM(amount) total, COUNT(*) n FROM payments GROUP BY currency")
+    earnings = cur.fetchall()
+    cur.execute(
         "SELECT telegram_id, username, generations_used, purchased_generations, "
         "subscription_until FROM users ORDER BY created_at DESC LIMIT 50"
-    ).fetchall()
+    )
+    users = cur.fetchall()
     conn.close()
     return {
         "total_users": total_users,
@@ -343,23 +357,23 @@ def get_admin_stats():
 def find_user_by_username(username: str):
     username = username.lstrip("@").lower()
     conn = db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT telegram_id FROM users WHERE LOWER(username)=?", (username,)
-    ).fetchone()
+    cur = dict_cur(conn)
+    cur.execute("SELECT telegram_id FROM users WHERE LOWER(username)=%s", (username,))
+    row = cur.fetchone()
     conn.close()
     return row["telegram_id"] if row else None
 
 
 def upsert_broadcast_channel(chat_id: int, title: str, chat_type: str, active: bool):
     conn = db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
         INSERT INTO broadcast_channels (chat_id, title, chat_type, active, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT(chat_id) DO UPDATE SET
-            title=excluded.title, chat_type=excluded.chat_type,
-            active=excluded.active, updated_at=excluded.updated_at
+            title=EXCLUDED.title, chat_type=EXCLUDED.chat_type,
+            active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
         """,
         (chat_id, title, chat_type, int(active), datetime.now(timezone.utc).isoformat()),
     )
@@ -369,20 +383,18 @@ def upsert_broadcast_channel(chat_id: int, title: str, chat_type: str, active: b
 
 def get_broadcast_targets():
     conn = db()
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT chat_id, title, chat_type FROM broadcast_channels WHERE active=1"
-    ).fetchall()
+    cur = dict_cur(conn)
+    cur.execute("SELECT chat_id, title, chat_type FROM broadcast_channels WHERE active=1")
+    rows = cur.fetchall()
     conn.close()
     return rows
 
 
 def list_all_broadcast_channels():
     conn = db()
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT chat_id, title, chat_type, active FROM broadcast_channels ORDER BY title"
-    ).fetchall()
+    cur = dict_cur(conn)
+    cur.execute("SELECT chat_id, title, chat_type, active FROM broadcast_channels ORDER BY title")
+    rows = cur.fetchall()
     conn.close()
     return rows
 
@@ -1489,18 +1501,20 @@ async def list_broadcast_chats(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def get_watch_hash(url: str):
     conn = db()
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT content_hash FROM site_watch WHERE url=?", (url,)).fetchone()
+    cur = dict_cur(conn)
+    cur.execute("SELECT content_hash FROM site_watch WHERE url=%s", (url,))
+    row = cur.fetchone()
     conn.close()
     return row["content_hash"] if row else None
 
 
 def set_watch_hash(url: str, content_hash: str):
     conn = db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         """
-        INSERT INTO site_watch (url, content_hash, last_checked) VALUES (?, ?, ?)
-        ON CONFLICT(url) DO UPDATE SET content_hash=excluded.content_hash, last_checked=excluded.last_checked
+        INSERT INTO site_watch (url, content_hash, last_checked) VALUES (%s, %s, %s)
+        ON CONFLICT(url) DO UPDATE SET content_hash=EXCLUDED.content_hash, last_checked=EXCLUDED.last_checked
         """,
         (url, content_hash, datetime.now(timezone.utc).isoformat()),
     )
